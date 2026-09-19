@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """The Ollama chat model implementation."""
 import json
+from collections import defaultdict
 from datetime import datetime
 from typing import Literal, Any, AsyncGenerator, TYPE_CHECKING, List, Type
 
@@ -248,6 +249,8 @@ class OllamaChatModel(ChatModelBase):
         response_id: str = _generate_id()
         text_id: str = _generate_id()
         thinking_id: str = _generate_id()
+        # Reuse tool IDs within this response, never across model calls.
+        tool_call_ids: dict[tuple[int, str], str] = defaultdict(_generate_id)
 
         async for chunk in response:
             delta_res = ChatResponse(
@@ -275,7 +278,7 @@ class OllamaChatModel(ChatModelBase):
             # Tool call
             for idx, tool_call in enumerate(msg.tool_calls or []):
                 delta_res.append_tool_call(
-                    block_id=f"{idx}_{tool_call.function.name}",
+                    block_id=tool_call_ids[idx, tool_call.function.name],
                     name=tool_call.function.name,
                     input=json.dumps(
                         tool_call.function.arguments,
@@ -318,10 +321,10 @@ class OllamaChatModel(ChatModelBase):
         if response.message.content:
             content_blocks.append(TextBlock(text=response.message.content))
 
-        for idx, tool_call in enumerate(response.message.tool_calls or []):
+        for tool_call in response.message.tool_calls or []:
             content_blocks.append(
                 ToolCallBlock(
-                    id=f"{idx}_{tool_call.function.name}",
+                    id=_generate_id(),
                     name=tool_call.function.name,
                     input=json.dumps(
                         tool_call.function.arguments,

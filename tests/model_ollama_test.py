@@ -5,7 +5,9 @@
 Tests cover both non-streaming and streaming modes.
 Ollama uses ollama.AsyncClient with async iterator streaming.
 """
+import importlib.util
 import json
+from datetime import datetime
 from typing import Any
 import unittest
 from unittest import IsolatedAsyncioTestCase
@@ -13,9 +15,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 from utils import AnyString
 
-from agentscope.message import TextBlock, ToolCallBlock, ThinkingBlock
+from agentscope.agent import Agent, InjectionConfig, ReActConfig
+from agentscope.message import (
+    TextBlock,
+    ToolCallBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    UserMsg,
+)
 from agentscope.model import OllamaChatModel
-from agentscope.tool import ToolChoice
+from agentscope.permission import PermissionBehavior, PermissionDecision
+from agentscope.tool import FunctionTool, Toolkit, ToolChunk, ToolChoice
+from agentscope.types import ReplyFinishedReason
 
 A = AnyString()
 
@@ -158,7 +169,7 @@ class TestOllamaNonStream(IsolatedAsyncioTestCase):
                 True,
                 [
                     ToolCallBlock.model_construct(
-                        id="0_get_weather",
+                        id=A,
                         created_at=A,
                         name="get_weather",
                         input=json.dumps({"city": "SH"}),
@@ -330,7 +341,7 @@ class TestOllamaStream(IsolatedAsyncioTestCase):
         responses = [r async for r in gen]
 
         tool_block = ToolCallBlock.model_construct(
-            id="0_search",
+            id=A,
             created_at=A,
             name="search",
             input=json.dumps({"q": "hello"}),
@@ -341,6 +352,198 @@ class TestOllamaStream(IsolatedAsyncioTestCase):
                 (False, [tool_block]),
                 (True, [tool_block]),
             ],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tool-call identity regressions
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("ollama"),
+    "ollama not installed",
+)
+class TestOllamaToolCallIdentities(IsolatedAsyncioTestCase):
+    """Tool identities must survive streaming and distinguish agent rounds."""
+
+    async def test_non_stream_agent_calls_same_tool_twice(self) -> None:
+        """Both non-streaming tool rounds execute within one agent reply."""
+        await self._check_agent_tool_rounds(stream=False)
+
+    async def test_stream_agent_calls_same_tool_twice(self) -> None:
+        """Both streaming tool rounds execute within one agent reply."""
+        await self._check_agent_tool_rounds(stream=True)
+
+    async def _check_agent_tool_rounds(self, stream: bool) -> None:
+        """Run two tool rounds and check their results in the agent state.
+
+        Args:
+            stream (`bool`):
+                Whether the mocked Ollama SDK returns streaming responses.
+        """
+        executed = []
+
+        async def lookup(value: str) -> ToolChunk:
+            """Return the requested value.
+
+            Args:
+                value (`str`):
+                    The value to look up.
+
+            Returns:
+                `ToolChunk`:
+                    The lookup result.
+            """
+            executed.append(value)
+            return ToolChunk(content=[TextBlock(text=value)])
+
+        responses = [
+            _mock_completion(
+                tool_calls=[{"name": "lookup", "args": {"value": value}}],
+            )
+            for value in ("first", "second")
+        ] + [_mock_completion(content="done")]
+        model = _make_model(stream=stream)
+        model.client.chat = AsyncMock(
+            side_effect=(
+                [_MockAsyncStream([r]) for r in responses]
+                if stream
+                else responses
+            ),
+        )
+        agent = Agent(
+            name="test",
+            system_prompt="Use lookup twice.",
+            model=model,
+            toolkit=Toolkit(
+                tools=[
+                    FunctionTool(
+                        lookup,
+                        permission=PermissionDecision(
+                            behavior=PermissionBehavior.ALLOW,
+                            message="Allow the test lookup tool.",
+                        ),
+                    ),
+                ],
+            ),
+            injection_config=InjectionConfig(inject_runtime_state=False),
+            react_config=ReActConfig(max_iters=4),
+        )
+
+        result = await agent.reply(
+            UserMsg(name="user", content="Look up first and second."),
+        )
+
+        self.assertEqual(executed, ["first", "second"])
+        self.assertEqual(model.client.chat.await_count, 3)
+        calls = agent.state.context[-1].get_content_blocks("tool_call")
+        self.assertEqual(len({call.id for call in calls}), 2)
+        expected_blocks = []
+        for call, value in zip(calls, ("first", "second")):
+            expected_blocks.extend(
+                [
+                    ToolCallBlock.model_construct(
+                        id=call.id,
+                        created_at=A,
+                        name="lookup",
+                        input=json.dumps({"value": value}),
+                        state="finished",
+                    ),
+                    ToolResultBlock.model_construct(
+                        id=call.id,
+                        created_at=A,
+                        name="lookup",
+                        output=[
+                            TextBlock.model_construct(
+                                id=A,
+                                created_at=A,
+                                text=value,
+                            ),
+                        ],
+                        state="success",
+                    ),
+                ],
+            )
+        expected_blocks.append(
+            TextBlock.model_construct(id=A, created_at=A, text="done"),
+        )
+        self.assertEqual(agent.state.context[-1].content, expected_blocks)
+        self.assertEqual(result.content, [expected_blocks[-1]])
+        self.assertEqual(result.finished_reason, ReplyFinishedReason.COMPLETED)
+        self.assertEqual(agent.state.get_unfinished_tool_calls(agent.name), [])
+
+    async def test_non_stream_multiple_tool_ids(self) -> None:
+        """Same-name calls in and across completions have distinct IDs."""
+        model = _make_model()
+        tool_calls = [
+            {"name": "lookup", "args": {"value": value}}
+            for value in ("first", "second")
+        ]
+        model.client.chat = AsyncMock(
+            side_effect=[
+                _mock_completion(tool_calls=tool_calls) for _ in range(2)
+            ],
+        )
+
+        responses = [await model([]) for _ in range(2)]
+
+        self.assertEqual(
+            [response.content for response in responses],
+            [
+                [
+                    ToolCallBlock.model_construct(
+                        id=A,
+                        created_at=A,
+                        name=call["name"],
+                        input=json.dumps(call["args"]),
+                    )
+                    for call in tool_calls
+                ],
+            ]
+            * 2,
+        )
+        self.assertEqual(
+            len({block.id for r in responses for block in r.content}),
+            4,
+        )
+
+    async def test_stream_tool_ids_stable_within_response(self) -> None:
+        """Repeated stream entries reuse IDs only within the same response."""
+        model = _make_model(stream=True)
+        tool_calls = [
+            {"name": "lookup", "args": {"value": "first"}},
+            {"name": "lookup", "args": {"value": "second"}},
+        ]
+        responses = []
+        for _ in range(2):
+            chunks = _MockAsyncStream(
+                [_make_stream_chunk(tool_calls=tool_calls) for _ in range(2)],
+            )
+            responses.append(
+                [
+                    r
+                    async for r in model._parse_stream_response(
+                        datetime.now(),
+                        chunks,
+                    )
+                ],
+            )
+
+        for response in responses:
+            expected = [
+                ToolCallBlock.model_construct(
+                    id=block.id,
+                    created_at=A,
+                    name=call["name"],
+                    input=json.dumps(call["args"]),
+                )
+                for block, call in zip(response[0].content, tool_calls)
+            ]
+            self.assertEqual([r.content for r in response], [expected] * 2)
+        self.assertEqual(
+            len({b.id for response in responses for b in response[0].content}),
+            4,
         )
 
 
